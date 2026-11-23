@@ -349,8 +349,14 @@ def _build_entry(name, stype, description, url, token, command, args, env, heade
             raise HTTPException(status_code=400, detail="url is required")
         connection = {"type": stype, "url": url, "headers": headers or {}}
         token = (token or "").strip()
+        # Bionic's Zod schema REQUIRES an auth object on every remote connection:
+        # {"type": "bearerToken", "token": "..."} or {"type": "none"}.
+        # A missing auth key makes Bionic reject the ENTIRE ng-mcp.json file
+        # (verified in Bionic main.log: ZodError invalid_type at servers[].connection.auth).
         if token:
             connection["auth"] = {"type": "bearerToken", "token": token}
+        else:
+            connection["auth"] = {"type": "none"}
     elif stype == "stdio":
         command = (command or "").strip()
         if not command:
