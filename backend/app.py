@@ -30,6 +30,7 @@ import signal
 import subprocess
 import urllib.request
 import urllib.error
+import urllib.parse
 import uuid
 
 from fastapi import FastAPI, HTTPException, Query
@@ -589,6 +590,10 @@ def _normalize_source_item(item) -> dict:
     name = inner.get("title") or inner.get("name") or inner.get("slug") or inner.get("id")
     if not isinstance(name, str):
         name = None
+    # A stable slug (the registry "name") lets us collapse duplicate versions of one server.
+    slug = inner.get("slug")
+    if not isinstance(slug, str) or not slug:
+        slug = inner.get("name") if isinstance(inner.get("name"), str) else ""
     description = inner.get("description") or ""
     homepage = (
         inner.get("websiteUrl")
@@ -609,6 +614,7 @@ def _normalize_source_item(item) -> dict:
     if command:
         return {
             "name": name or "stdio-server",
+            "slug": slug or "",
             "description": description,
             "type": "stdio",
             "url": "",
@@ -639,6 +645,7 @@ def _normalize_source_item(item) -> dict:
         name = url
     return {
         "name": name,
+        "slug": slug or "",
         "description": description,
         "type": stype,
         "url": url,
@@ -663,34 +670,87 @@ async def get_sources():
     return {"sources": SOURCES}
 
 
+# The official registry caps a page at 100 items (larger values return HTTP 422).
+REGISTRY_PAGE_LIMIT = 100
+
+
+def _dedupe_by_name(servers: list) -> list:
+    """Collapse duplicate servers — the registry stores many versions per slug."""
+    seen = set()
+    out = []
+    for s in servers:
+        key = (s.get("slug") or s.get("name") or "").strip().lower()
+        if not key:
+            key = (s.get("url") or s.get("command") or "").strip().lower()
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(s)
+    return out
+
+
+def _filter_by_search(servers: list, term: str) -> list:
+    q = (term or "").strip().lower()
+    if not q:
+        return servers
+    out = []
+    for s in servers:
+        hay = " ".join(str(s.get(k) or "") for k in ("name", "description", "url", "homepage")).lower()
+        if q in hay:
+            out.append(s)
+    return out
+
+
 @app.get("/mcp/sources/fetch")
-async def fetch_source(id: str = Query(default=None), url: str = Query(default=None)):
+async def fetch_source(
+    id: str = Query(default=None),
+    url: str = Query(default=None),
+    search: str = Query(default=None),
+    cursor: str = Query(default=None),
+):
     target = None
     source_name = "custom source"
     builtin_items = None
+    is_registry = False
     if id:
         for s in SOURCES:
             if s["id"] == id:
                 source_name = s["name"]
                 target = s.get("url")
+                is_registry = s.get("id") == "official"
                 if s.get("builtin"):
                     builtin_items = s.get("servers", [])
                 break
     elif url:
         target = url.strip()
+
     # Built-in sources are served locally — no network fetch required.
     if builtin_items is not None:
+        servers = _filter_by_search(list(builtin_items), search)
         return {
             "source": source_name,
             "url": target or "",
-            "count": len(builtin_items),
-            "servers": builtin_items,
+            "count": len(servers),
+            "servers": servers,
+            "next_cursor": None,
         }
     if not target:
         raise HTTPException(status_code=400, detail="Provide id or url")
 
+    # For the official registry, ask the server for a full page + optional search.
+    fetch_url = target
+    if is_registry:
+        parts = [f"limit={REGISTRY_PAGE_LIMIT}"]
+        if (search or "").strip():
+            parts.append("search=" + urllib.parse.quote(search.strip()))
+        if (cursor or "").strip():
+            parts.append("cursor=" + urllib.parse.quote(cursor.strip()))
+        sep = "&" if "?" in target else "?"
+        fetch_url = target + sep + "&".join(parts)
+
     try:
-        raw = _fetch_url(target)
+        raw = _fetch_url(fetch_url)
         data = json.loads(raw)
     except urllib.error.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Source returned HTTP {e.code}")
@@ -705,7 +765,21 @@ async def fetch_source(id: str = Query(default=None), url: str = Query(default=N
         norm = _normalize_source_item(it)
         if norm:
             servers.append(norm)
-    return {"source": source_name, "url": target, "count": len(servers), "servers": servers}
+    servers = _dedupe_by_name(servers)
+
+    next_cursor = None
+    if isinstance(data, dict):
+        meta = data.get("metadata")
+        if isinstance(meta, dict) and meta.get("nextCursor"):
+            next_cursor = meta.get("nextCursor")
+
+    return {
+        "source": source_name,
+        "url": target,
+        "count": len(servers),
+        "servers": servers,
+        "next_cursor": next_cursor,
+    }
 
 
 def _entry_key(entry) -> str:

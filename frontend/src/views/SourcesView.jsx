@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../api';
 import './SourcesView.css';
 
@@ -32,22 +32,33 @@ function targetOf(s) {
   return (s.type === 'stdio' ? s.command : s.url) || '';
 }
 
+function nameKey(s) {
+  return ((s && (s.slug || s.name)) || '').trim().toLowerCase();
+}
+
 const SourcesView = () => {
   const [sources, setSources] = useState([]); // built-in trusted sources
   const [custom, setCustom] = useState(loadCustom);
   const [customUrl, setCustomUrl] = useState('');
 
-  const [active, setActive] = useState(null); // {id?, url, name}
+  const [active, setActive] = useState(null); // {id?, url, name, builtin?}
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState('');
   const [servers, setServers] = useState([]);
+  const [nextCursor, setNextCursor] = useState(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [activeSearch, setActiveSearch] = useState(''); // term actually applied to the server
 
   const [configured, setConfigured] = useState([]);
   const [selected, setSelected] = useState({}); // row index -> bool
   const [testResults, setTestResults] = useState({}); // row index -> {state, text}
-  const [bulk, setBulk] = useState(null); // {added, skipped, errors}
+  const [bulk, setBulk] = null;
   const [adding, setAdding] = useState(false);
   const [restartMsg, setRestartMsg] = useState('');
+
+  const reqRef = useRef(0); // guard against out-of-order responses
+  const searchTimer = useRef(null); // debounce handle for the search box
 
   const configuredTargets = useCallback(() => {
     const set = new Set();
@@ -85,27 +96,85 @@ const SourcesView = () => {
     return configuredTargets().has(t.trim().toLowerCase());
   };
 
-  const fetchSource = async (src) => {
-    setActive(src);
-    setFetchError('');
-    setFetching(true);
+  // Search box + "Load more" only make sense for sources that support them.
+  const supportsSearch = !!(active && (active.builtin || active.id === 'official'));
+  const canLoadMore = !!(active && active.id === 'official' && nextCursor);
+
+  const fetchPage = async (src, search = '', cursor = null) => {
+    const params = new URLSearchParams();
+    if (src.id) params.set('id', src.id);
+    else params.set('url', src.url);
+    if (search) params.set('search', search);
+    if (cursor) params.set('cursor', cursor);
+    return api(`/mcp/sources/fetch?${params.toString()}`);
+  };
+
+  const resetResults = () => {
     setServers([]);
     setSelected({});
     setBulk(null);
     setTestResults({});
     setRestartMsg('');
+    setNextCursor(null);
+    setFetchError('');
+  };
+
+  const loadSource = async (src, search = '') => {
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    const reqId = ++reqRef.current;
+    setActive(src);
+    setSearchText(search);
+    setActiveSearch(search);
+    resetResults();
+    setFetching(true);
     try {
-      const q = src.id ? `id=${encodeURIComponent(src.id)}` : `url=${encodeURIComponent(src.url)}`;
-      const data = await api(`/mcp/sources/fetch?${q}`);
+      const data = await fetchPage(src, search, null);
+      if (reqId !== reqRef.current) return; // superseded by a newer request
       setServers(data.servers || []);
+      setNextCursor(data.next_cursor || null);
       if ((data.servers || []).length === 0) {
-        setFetchError('That source returned no usable MCP servers. It may not be a valid MCP catalog URL.');
+        setFetchError(
+          search
+            ? `No servers matched “${search}”.`
+            : 'That source returned no usable MCP servers. It may not be a valid MCP catalog URL.'
+        );
       }
     } catch (err) {
+      if (reqId !== reqRef.current) return;
       setFetchError(err.message || 'Failed to fetch that source.');
     } finally {
-      setFetching(false);
+      if (reqId === reqRef.current) setFetching(false);
     }
+  };
+
+  const loadMore = async () => {
+    if (!active || !nextCursor || loadingMore) return;
+    const reqId = ++reqRef.current;
+    setLoadingMore(true);
+    try {
+      const data = await fetchPage(active, activeSearch.trim(), nextCursor);
+      if (reqId !== reqRef.current) return;
+      const existing = new Set(servers.map(nameKey).filter(Boolean));
+      const fresh = (data.servers || []).filter((s) => {
+        const k = nameKey(s);
+        return !k || !existing.has(k);
+      });
+      setServers((prev) => [...prev, ...fresh]);
+      setNextCursor(data.next_cursor || null);
+    } catch (err) {
+      if (reqId === reqRef.current) setFetchError(err.message || 'Failed to load more.');
+    } finally {
+      if (reqId === reqRef.current) setLoadingMore(false);
+    }
+  };
+
+  const onSearchChange = (val) => {
+    setSearchText(val);
+    if (!active || !supportsSearch) return;
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => {
+      loadSource(active, val.trim());
+    }, 350);
   };
 
   const addCustom = (e) => {
@@ -127,7 +196,7 @@ const SourcesView = () => {
     setCustom(next);
     saveCustom(next);
     setCustomUrl('');
-    fetchSource(entry);
+    loadSource(entry, '');
   };
 
   const removeCustom = (url) => {
@@ -136,7 +205,7 @@ const SourcesView = () => {
     saveCustom(next);
     if (active && active.url === url) {
       setActive(null);
-      setServers([]);
+      resetResults();
     }
   };
 
@@ -211,6 +280,11 @@ const SourcesView = () => {
     }
   };
 
+  const plural = servers.length === 1 ? 'server' : 'servers';
+  const countText = fetching
+    ? 'Loading…'
+    : `${servers.length} ${plural}${activeSearch ? ` matching “${activeSearch}”` : ''}.`;
+
   return (
     <div className="sources-view">
       <h2>MCP Sources</h2>
@@ -230,13 +304,13 @@ const SourcesView = () => {
             <button
               key={s.id}
               className={`src-item ${active && active.id === s.id ? 'active' : ''}`}
-              onClick={() => fetchSource(s)}
+              onClick={() => loadSource(s, '')}
               disabled={fetching}
             >
               <span className="src-name">
                 {s.name}
                 {s.trusted ? <span className="badge info" style={{ marginLeft: 8 }}>trusted</span> : null}
-              {s.builtin ? <span className="badge info" style={{ marginLeft: 8 }}>built-in</span> : null}
+                {s.builtin ? <span className="badge info" style={{ marginLeft: 8 }}>built-in</span> : null}
               </span>
               <span className="src-url">{s.url}</span>
             </button>
@@ -247,7 +321,7 @@ const SourcesView = () => {
               key={c.url}
               className={`src-item ${active && active.url === c.url ? 'active' : ''}`}
             >
-              <button className="src-item-btn" onClick={() => fetchSource(c)} disabled={fetching}>
+              <button className="src-item-btn" onClick={() => loadSource(c, '')} disabled={fetching}>
                 <span className="src-name">{c.name}</span>
                 <span className="src-url">{c.url}</span>
               </button>
@@ -283,9 +357,7 @@ const SourcesView = () => {
           <div className="row space">
             <div>
               <h3>{active.name}</h3>
-              <p className="card-desc">
-                {fetching ? 'Loading…' : `${servers.length} server(s) found.`}
-              </p>
+              <p className="card-desc">{countText}</p>
             </div>
             <div className="inline">
               {selectableIdx.length > 0 && (
@@ -310,62 +382,84 @@ const SourcesView = () => {
             </div>
           </div>
 
+          {supportsSearch && (
+            <div className="field" style={{ margin: '12px 0' }}>
+              <input
+                value={searchText}
+                onChange={(e) => onSearchChange(e.target.value)}
+                placeholder="Search by name, description, or URL…"
+                style={{ width: '100%', boxSizing: 'border-box' }}
+              />
+            </div>
+          )}
+
           {fetching && <p className="muted" style={{ marginTop: 12 }}>Fetching and normalizing…</p>}
 
           {!fetching && servers.length > 0 && (
-            <div className="src-rows">
-              {servers.map((s, i) => {
-                const t = testResults[i];
-                const target = targetOf(s);
-                const configured = isConfigured(s);
-                const disabled = !target;
-                return (
-                  <div className={`src-row ${disabled ? 'disabled' : ''}`} key={i}>
-                    <input
-                      type="checkbox"
-                      checked={!!selected[i]}
-                      disabled={disabled}
-                      onChange={() => toggleRow(i)}
-                    />
-                    <div className="src-row-main">
-                      <div className="src-row-title">
-                        <span className="src-name">{s.name}</span>
-                        <span className="badge info">{TYPE_LABELS[s.type] || s.type || 'unknown'}</span>
-                        {configured && <span className="badge ok">✓ already in Bionic</span>}
-                        {!target && <span className="badge">no target</span>}
-                        {s.homepage && (
-                          <a
-                            className="src-home"
-                            href={s.homepage}
-                            target="_blank"
-                            rel="noreferrer"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            link ↗
-                          </a>
+            <>
+              <div className="src-rows">
+                {servers.map((s, i) => {
+                  const t = testResults[i];
+                  const target = targetOf(s);
+                  const configured = isConfigured(s);
+                  const disabled = !target;
+                  return (
+                    <div className={`src-row ${disabled ? 'disabled' : ''}`} key={i}>
+                      <input
+                        type="checkbox"
+                        checked={!!selected[i]}
+                        disabled={disabled}
+                        onChange={() => toggleRow(i)}
+                      />
+                      <div className="src-row-main">
+                        <div className="src-row-title">
+                          <span className="src-name">{s.name}</span>
+                          <span className="badge info">{TYPE_LABELS[s.type] || s.type || 'unknown'}</span>
+                          {configured && <span className="badge ok">✓ already in Bionic</span>}
+                          {!target && <span className="badge">no target</span>}
+                          {s.homepage && (
+                            <a
+                              className="src-home"
+                              href={s.homepage}
+                              target="_blank"
+                              rel="noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              link ↗
+                            </a>
+                          )}
+                        </div>
+                        {target && <div className="src-target">{target}</div>}
+                        {s.description && <p className="muted">{s.description}</p>}
+                        {t && t.state !== 'testing' && (
+                          <div className="test-result">
+                            <span className={`badge ${t.state === 'ok' ? 'ok' : 'fail'}`}>
+                              {t.state === 'ok' ? '✓ ' : '✕ '} {t.text}
+                            </span>
+                          </div>
                         )}
                       </div>
-                      {target && <div className="src-target">{target}</div>}
-                      {s.description && <p className="muted">{s.description}</p>}
-                      {t && t.state !== 'testing' && (
-                        <div className="test-result">
-                          <span className={`badge ${t.state === 'ok' ? 'ok' : 'fail'}`}>
-                            {t.state === 'ok' ? '✓ ' : '✕ '} {t.text}
-                          </span>
-                        </div>
-                      )}
+                      <button
+                        className="btn"
+                        onClick={() => testRow(s, i)}
+                        disabled={disabled || (t && t.state === 'testing')}
+                      >
+                        {t && t.state === 'testing' ? <span className="spin" /> : 'Test'}
+                      </button>
                     </div>
-                    <button
-                      className="btn"
-                      onClick={() => testRow(s, i)}
-                      disabled={disabled || (t && t.state === 'testing')}
-                    >
-                      {t && t.state === 'testing' ? <span className="spin" /> : 'Test'}
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
+                  );
+                })}
+              </div>
+
+              {canLoadMore && (
+                <div className="row" style={{ marginTop: 12 }}>
+                  <button className="btn" onClick={loadMore} disabled={loadingMore}>
+                    {loadingMore ? <span className="spin" /> : 'Load more…'}
+                  </button>
+                  <span className="muted">More servers available in this registry.</span>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
