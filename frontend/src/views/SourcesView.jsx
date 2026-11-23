@@ -10,6 +10,10 @@ const TYPE_LABELS = {
 
 const CUSTOM_KEY = 'bionicdeck.customSources';
 
+// Safety cap for "Load all": the official registry runs to ~1900+ servers across
+// ~60+ pages. Paging is sequential and live; 80 pages is more than enough in practice.
+const LOAD_ALL_MAX_PAGES = 80;
+
 function loadCustom() {
   try {
     const raw = localStorage.getItem(CUSTOM_KEY);
@@ -58,6 +62,8 @@ const SourcesView = () => {
   const [servers, setServers] = useState([]);
   const [nextCursor, setNextCursor] = useState(null);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [loadingAll, setLoadingAll] = useState(false);
+  const [loadAllMsg, setLoadAllMsg] = useState('');
   const [searchText, setSearchText] = useState('');
   const [activeSearch, setActiveSearch] = useState(''); // term actually applied to the server
 
@@ -138,6 +144,7 @@ const SourcesView = () => {
     setTestResults({});
     setRestartMsg('');
     setNextCursor(null);
+    setLoadAllMsg('');
     setFetchError('');
   };
 
@@ -190,6 +197,65 @@ const SourcesView = () => {
     }
   };
 
+  // Page through the registry sequentially (reusing the cursor endpoint), appending
+  // new servers as each page arrives with live progress. For a *specific* server,
+  // the search box is much faster than paging through the whole registry.
+  const loadAll = async () => {
+    if (!active || !nextCursor || loadingAll || loadingMore) return;
+    const reqId = ++reqRef.current;
+    setLoadingAll(true);
+    setLoadAllMsg('');
+    const seen = new Set(servers.map(nameKey).filter(Boolean));
+    let cursor = nextCursor;
+    let pages = 0;
+    let total = 0;
+    try {
+      while (cursor && pages < LOAD_ALL_MAX_PAGES) {
+        if (reqId !== reqRef.current) return; // user searched or switched source
+        setLoadAllMsg(`Loading page ${pages + 1}…`);
+        const data = await fetchPage(active, activeSearch.trim(), cursor);
+        if (reqId !== reqRef.current) return;
+        const fresh = (data.servers || []).filter((s) => {
+          const k = nameKey(s);
+          if (!k || seen.has(k)) return false;
+          if (k) seen.add(k);
+          return true;
+        });
+        total += fresh.length;
+        if (fresh.length > 0) {
+          setServers((prev) => {
+            const keys = new Set(prev.map(nameKey).filter(Boolean));
+            const add = fresh.filter((s) => {
+              const k = nameKey(s);
+              if (!k || keys.has(k)) return false;
+              if (k) keys.add(k);
+              return true;
+            });
+            return [...prev, ...add];
+          });
+        }
+        cursor = data.next_cursor || null;
+        pages += 1;
+        if (reqId === reqRef.current) {
+          setLoadAllMsg(`Loaded ${total} more servers (page ${pages}${cursor ? '' : ' — end of registry'})…`);
+        }
+      }
+      if (reqId !== reqRef.current) return;
+      setNextCursor(cursor);
+      setLoadAllMsg(
+        cursor
+          ? `Stopped at the ${LOAD_ALL_MAX_PAGES}-page safety cap after ${total} more servers. Search above to find a specific one, or keep using Load more.`
+          : `Done — loaded ${total} more servers. The whole registry is now listed above.`
+      );
+    } catch (err) {
+      if (reqId === reqRef.current) {
+        setLoadAllMsg(`Load all stopped: ${err.message || 'fetch failed'}`);
+      }
+    } finally {
+      setLoadingAll(false);
+    }
+  };
+
   const onSearchChange = (val) => {
     setSearchText(val);
     if (!active || !supportsSearch) return;
@@ -226,6 +292,7 @@ const SourcesView = () => {
     setCustom(next);
     saveCustom(next);
     if (active && active.url === url) {
+      reqRef.current += 1; // cancel any in-flight fetch / load-all for this source
       setActive(null);
       resetResults();
     }
@@ -498,12 +565,26 @@ const SourcesView = () => {
               </div>
 
               {canLoadMore && (
-                <div className="row" style={{ marginTop: 12 }}>
-                  <button className="btn" onClick={loadMore} disabled={loadingMore}>
+                <div className="row" style={{ marginTop: 12, alignItems: 'center' }}>
+                  <button className="btn" onClick={loadMore} disabled={loadingMore || loadingAll}>
                     {loadingMore ? <span className="spin" /> : 'Load more…'}
                   </button>
-                  <span className="muted">More servers available in this registry.</span>
+                  <button
+                    className="btn btn-primary"
+                    onClick={loadAll}
+                    disabled={loadingAll || loadingMore}
+                    title="Page through the entire registry (1900+ servers) with live progress"
+                  >
+                    {loadingAll ? <span className="spin" /> : 'Load all…'}
+                  </button>
+                  <span className="muted" style={{ marginLeft: 8 }}>
+                    {loadAllMsg ||
+                      'This is page 1 of a registry with 1900+ servers — search above to find one, or load more/all.'}
+                  </span>
                 </div>
+              )}
+              {!canLoadMore && loadAllMsg && (
+                <p className="muted" style={{ marginTop: 8 }}>{loadAllMsg}</p>
               )}
             </>
           )}
