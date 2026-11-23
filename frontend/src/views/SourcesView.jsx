@@ -53,7 +53,7 @@ const SourcesView = () => {
   const [configured, setConfigured] = useState([]);
   const [selected, setSelected] = useState({}); // row index -> bool
   const [testResults, setTestResults] = useState({}); // row index -> {state, text}
-  const [bulk, setBulk] = null;
+  const [bulk, setBulk] = useState(null);
   const [adding, setAdding] = useState(false);
   const [restartMsg, setRestartMsg] = useState('');
 
