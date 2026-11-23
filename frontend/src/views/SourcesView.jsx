@@ -29,7 +29,18 @@ function saveCustom(list) {
 }
 
 function targetOf(s) {
-  return (s.type === 'stdio' ? s.command : s.url) || '';
+  if (!s) return '';
+  if (s.type === 'stdio') {
+    const args = Array.isArray(s.args) ? s.args : [];
+    return [s.command, ...args].filter(Boolean).join(' ');
+  }
+  return s.url || '';
+}
+
+function stdioSignature(s) {
+  if (!s || !s.command) return '';
+  const args = Array.isArray(s.args) ? s.args : [];
+  return [s.command, ...args].filter(Boolean).join(' ').trim().toLowerCase();
 }
 
 function nameKey(s) {
@@ -63,8 +74,12 @@ const SourcesView = () => {
   const configuredTargets = useCallback(() => {
     const set = new Set();
     (configured || []).forEach((s) => {
-      const t = (s.type === 'stdio' ? s.command : s.url) || '';
-      if (t) set.add(t.trim().toLowerCase());
+      if (s.url) set.add(s.url.trim().toLowerCase());
+      if (s.command) {
+        set.add(s.command.trim().toLowerCase());
+        const full = stdioSignature(s);
+        if (full) set.add(full);
+      }
     });
     return set;
   }, [configured]);
@@ -91,9 +106,16 @@ const SourcesView = () => {
   }, [loadConfigured]);
 
   const isConfigured = (s) => {
-    const t = targetOf(s);
-    if (!t) return false;
-    return configuredTargets().has(t.trim().toLowerCase());
+    if (!s) return false;
+    const set = configuredTargets();
+    const cands = [];
+    if (s.url) cands.push(s.url.trim().toLowerCase());
+    if (s.command) {
+      cands.push(s.command.trim().toLowerCase());
+      const full = stdioSignature(s);
+      if (full) cands.push(full);
+    }
+    return cands.some((c) => set.has(c));
   };
 
   // Search box + "Load more" only make sense for sources that support them.
@@ -237,6 +259,7 @@ const SourcesView = () => {
           token: s.token || '',
           command: s.command,
           args: s.args || [],
+          env: s.env || {},
         }),
       });
       setTestResults((t) => ({
@@ -387,7 +410,7 @@ const SourcesView = () => {
               <input
                 value={searchText}
                 onChange={(e) => onSearchChange(e.target.value)}
-                placeholder="Search by name, description, or URL…"
+                placeholder="Search servers by name, description, or package…"
                 style={{ width: '100%', boxSizing: 'border-box' }}
               />
             </div>
@@ -415,8 +438,21 @@ const SourcesView = () => {
                         <div className="src-row-title">
                           <span className="src-name">{s.name}</span>
                           <span className="badge info">{TYPE_LABELS[s.type] || s.type || 'unknown'}</span>
+                          {s.is_latest && <span className="badge ok">latest</span>}
+                          {s.version && !s.is_latest && <span className="badge">v{s.version}</span>}
                           {configured && <span className="badge ok">✓ already in Bionic</span>}
                           {!target && <span className="badge">no target</span>}
+                          {s.repository && (
+                            <a
+                              className="src-home"
+                              href={s.repository}
+                              target="_blank"
+                              rel="noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              source ↗
+                            </a>
+                          )}
                           {s.homepage && (
                             <a
                               className="src-home"
@@ -430,6 +466,16 @@ const SourcesView = () => {
                           )}
                         </div>
                         {target && <div className="src-target">{target}</div>}
+                        {s.type === 'stdio' && Array.isArray(s.config) && s.config.length > 0 && (
+                          <div className="muted" style={{ fontSize: 12 }}>
+                            Needs {s.config.length} env var{s.config.length > 1 ? 's' : ''}:{' '}
+                            {s.config.map((c) => (
+                              <span key={c.name} title={c.description} style={{ marginRight: 6 }}>
+                                {c.name}{c.required ? '*' : ''}
+                              </span>
+                            ))}
+                          </div>
+                        )}
                         {s.description && <p className="muted">{s.description}</p>}
                         {t && t.state !== 'testing' && (
                           <div className="test-result">

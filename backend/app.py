@@ -355,11 +355,12 @@ def _build_entry(name, stype, description, url, token, command, args, env, heade
         command = (command or "").strip()
         if not command:
             raise HTTPException(status_code=400, detail="command is required")
+        clean_env = {k: v for k, v in (env or {}).items() if v not in (None, "")}
         connection = {
             "type": "stdio",
             "command": command,
             "args": args or [],
-            "env": env or {},
+            "env": clean_env,
         }
     else:
         raise HTTPException(status_code=400, detail=f"unsupported type: {stype}")
@@ -581,27 +582,125 @@ def _extract_server_list(data):
     return []
 
 
+def _package_args(pkg) -> list:
+    """Extract CLI arguments from a registry package definition."""
+    args = []
+    raw = pkg.get("packageArguments")
+    if isinstance(raw, list):
+        for a in raw:
+            if isinstance(a, dict) and "value" in a:
+                args.append(str(a["value"]))
+            elif isinstance(a, str):
+                args.append(a)
+    return args
+
+
+def _env_options(pkg) -> list:
+    """Structured env-var config options the user may need to fill in."""
+    opts = []
+    raw = pkg.get("environmentVariables")
+    if isinstance(raw, list):
+        for v in raw:
+            if isinstance(v, dict) and v.get("name"):
+                opts.append(
+                    {
+                        "name": str(v["name"]),
+                        "description": v.get("description") or "",
+                        "required": bool(v.get("isRequired")),
+                        "secret": bool(v.get("isSecret")),
+                    }
+                )
+    return opts
+
+
+def _stdio_from_package(pkg):
+    """Turn a registry `packages[]` entry into a runnable stdio command. None if unsupported."""
+    reg = (pkg.get("registryType") or "").lower()
+    ident = pkg.get("identifier")
+    if not isinstance(ident, str) or not ident:
+        return None
+    pkgargs = _package_args(pkg)
+    if reg == "npm":
+        command, base = "npx", ["-y", ident]
+    elif reg == "pypi":
+        command, base = "uvx", [ident]
+    elif reg == "oci":
+        command, base = "docker", ["run", "-i", "--rm", ident]
+    elif reg == "pipx":
+        command, base = "pipx", ["run", ident]
+    else:  # mcpb or anything else — best effort
+        command, base = (reg or "stdio"), [ident]
+    return {
+        "type": "stdio",
+        "command": command,
+        "args": base + pkgargs,
+        "env": {o["name"]: "" for o in _env_options(pkg)},
+        "config": _env_options(pkg),
+    }
+
+
+def _pick_remote(remotes):
+    """Pick the best remote endpoint (prefer streamable-http, then http, then sse)."""
+    order = {"streamable-http": 0, "http": 1, "sse": 2}
+    best = None
+    best_rank = 99
+    for r in remotes:
+        if not isinstance(r, dict):
+            continue
+        u = r.get("url") or r.get("endpoint")
+        if not u:
+            continue
+        rank = order.get((r.get("type") or "").lower(), 3)
+        if rank < best_rank:
+            best_rank = rank
+            best = (u, r.get("type"))
+    return best
+
+
 def _normalize_source_item(item) -> dict:
     """Map a catalog item (many shapes) to the app's canonical server shape."""
     if not isinstance(item, dict):
         return None
     inner = item.get("server") if isinstance(item.get("server"), dict) else item
 
-    name = inner.get("title") or inner.get("name") or inner.get("slug") or inner.get("id")
-    if not isinstance(name, str):
-        name = None
     # A stable slug (the registry "name") lets us collapse duplicate versions of one server.
     slug = inner.get("slug")
     if not isinstance(slug, str) or not slug:
         slug = inner.get("name") if isinstance(inner.get("name"), str) else ""
+
+    name = inner.get("title") or inner.get("name") or slug or inner.get("id")
+    if not isinstance(name, str) or not name:
+        name = slug or "MCP server"
+
     description = inner.get("description") or ""
-    homepage = (
-        inner.get("websiteUrl")
-        or inner.get("homepage")
-        or inner.get("repository")
-        or inner.get("website")
-        or ""
-    )
+
+    # Version + latest flag. The registry nests this at the ITEM level under a
+    # namespaced key, e.g. item._meta["io.modelcontextprotocol.registry/official"]["isLatest"].
+    version = inner.get("version")
+    if not isinstance(version, str):
+        version = ""
+    is_latest = False
+    meta = item.get("_meta") if isinstance(item.get("_meta"), dict) else (inner.get("_meta") if isinstance(inner.get("_meta"), dict) else {})
+    if isinstance(meta, dict):
+        off = None
+        for val in meta.values():
+            if isinstance(val, dict) and "isLatest" in val:
+                off = val
+                break
+        if off is None and isinstance(meta.get("official"), dict):
+            off = meta.get("official")
+        if isinstance(off, dict):
+            is_latest = bool(off.get("isLatest"))
+
+    # Repository + website, for richer links.
+    repository = ""
+    repo = inner.get("repository")
+    if isinstance(repo, dict):
+        repository = repo.get("url") or ""
+    elif isinstance(repo, str):
+        repository = repo
+    website = inner.get("websiteUrl") or inner.get("homepage") or inner.get("website") or ""
+
     raw_token = inner.get("token")
     if not raw_token and isinstance(inner.get("auth"), dict):
         raw_token = inner["auth"].get("token")
@@ -609,52 +708,84 @@ def _normalize_source_item(item) -> dict:
         raw_token = inner.get("apiKey")
     token = (raw_token or "").strip() if isinstance(raw_token, str) else ""
 
-    # stdio / local server
+    common = {
+        "name": name,
+        "slug": slug or "",
+        "description": description,
+        "version": version,
+        "is_latest": is_latest,
+        "repository": repository,
+        "homepage": website or repository or "",
+        "token": token,
+    }
+
+    # 1) Remote (URL) servers — easiest to bulk-add (no local tooling needed).
+    remotes = inner.get("remotes")
+    endpoints = []
+    if isinstance(remotes, list):
+        for r in remotes:
+            if isinstance(r, dict) and (r.get("url") or r.get("endpoint")):
+                endpoints.append(
+                    {
+                        "type": (r.get("type") or "").lower() or "http",
+                        "url": r.get("url") or r.get("endpoint"),
+                    }
+                )
+    primary = _pick_remote(remotes) if isinstance(remotes, list) else None
+    if primary:
+        url, rtype = primary
+        stype = _map_type(rtype) or ("sse" if "/sse" in url.lower() else "streamableHttp")
+        return {
+            **common,
+            "type": stype,
+            "url": url,
+            "command": "",
+            "args": [],
+            "env": {},
+            "config": [],
+            "endpoints": endpoints,
+        }
+
+    # 2) stdio servers shipped as installable packages (npm / pypi / docker / mcpb).
+    packages = inner.get("packages")
+    if isinstance(packages, list) and packages:
+        for p in packages:
+            if not isinstance(p, dict):
+                continue
+            stdio = _stdio_from_package(p)
+            if stdio:
+                return {**common, **stdio, "url": "", "endpoints": []}
+
+    # 3) Explicit stdio command (common in custom JSON dumps).
     command = inner.get("command") or inner.get("cmd")
     if command:
         return {
-            "name": name or "stdio-server",
-            "slug": slug or "",
-            "description": description,
+            **common,
             "type": "stdio",
             "url": "",
             "command": command,
             "args": list(inner.get("args") or inner.get("arguments") or []),
             "env": inner.get("env") or {},
-            "token": "",
-            "homepage": homepage or "",
+            "config": [],
+            "endpoints": [],
         }
 
-    # remote (URL) server
-    url = None
-    stype = None
-    remotes = inner.get("remotes")
-    if isinstance(remotes, list) and remotes:
-        first = remotes[0] or {}
-        url = first.get("url") or first.get("endpoint")
-        stype = _map_type(first.get("type"))
-    if not url:
-        url = inner.get("url") or inner.get("endpoint") or inner.get("sseUrl")
-        if inner.get("sseUrl"):
-            stype = "sse"
-    if not url:
-        return None
-    if not stype:
-        stype = "sse" if "/sse" in (url or "").lower() else "streamableHttp"
-    if not name:
-        name = url
-    return {
-        "name": name,
-        "slug": slug or "",
-        "description": description,
-        "type": stype,
-        "url": url,
-        "command": "",
-        "args": [],
-        "env": {},
-        "token": token,
-        "homepage": homepage or "",
-    }
+    # 4) Bare URL (custom dumps that just list a url field).
+    url = inner.get("url") or inner.get("endpoint") or inner.get("sseUrl")
+    if url:
+        stype = "sse" if (inner.get("sseUrl") or "/sse" in str(url).lower()) else "streamableHttp"
+        return {
+            **common,
+            "type": stype,
+            "url": url,
+            "command": "",
+            "args": [],
+            "env": {},
+            "config": [],
+            "endpoints": [],
+        }
+
+    return None
 
 
 def _fetch_url(url: str, timeout: int = 20) -> str:
@@ -675,19 +806,32 @@ REGISTRY_PAGE_LIMIT = 100
 
 
 def _dedupe_by_name(servers: list) -> list:
-    """Collapse duplicate servers — the registry stores many versions per slug."""
-    seen = set()
-    out = []
+    """Collapse duplicate slugs, keeping the best (latest) version of each server."""
+    groups = {}
+    order = []
     for s in servers:
         key = (s.get("slug") or s.get("name") or "").strip().lower()
         if not key:
             key = (s.get("url") or s.get("command") or "").strip().lower()
-        if key and key in seen:
+        if not key:
+            key = f"__noidx_{id(s)}"
+        if key not in groups:
+            groups[key] = s
+            order.append(key)
             continue
-        if key:
-            seen.add(key)
-        out.append(s)
-    return out
+        cur = groups[key]
+        # Prefer an explicitly-latest entry, then a higher version, then a remote form.
+        if bool(s.get("is_latest")) and not bool(cur.get("is_latest")):
+            groups[key] = s
+        elif s.get("is_latest") == cur.get("is_latest") and (s.get("version") or "") > (cur.get("version") or ""):
+            groups[key] = s
+        elif (
+            s.get("is_latest") == cur.get("is_latest")
+            and s.get("type") == "streamableHttp"
+            and cur.get("type") != "streamableHttp"
+        ):
+            groups[key] = s
+    return [groups[k] for k in order]
 
 
 def _filter_by_search(servers: list, term: str) -> list:
@@ -696,7 +840,20 @@ def _filter_by_search(servers: list, term: str) -> list:
         return servers
     out = []
     for s in servers:
-        hay = " ".join(str(s.get(k) or "") for k in ("name", "description", "url", "homepage")).lower()
+        parts = [
+            s.get("name"),
+            s.get("slug"),
+            s.get("description"),
+            s.get("url"),
+            s.get("homepage"),
+            s.get("repository"),
+            s.get("command"),
+        ]
+        if isinstance(s.get("args"), list):
+            parts.extend(s["args"])
+        if isinstance(s.get("config"), list):
+            parts.extend(c.get("name") for c in s["config"] if isinstance(c, dict))
+        hay = " ".join(str(p).lower() for p in parts if p is not None)
         if q in hay:
             out.append(s)
     return out
