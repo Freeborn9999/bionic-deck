@@ -1,0 +1,44 @@
+# ---- Dependencies ----
+node_modules/
+.venv/
+venv/
+env/
+
+# ---- Build output ----
+frontend/build/
+dist/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---- Logs / runtime ----
+*.log
+backend_run.log
+npm-debug.log*
+frontend/npm-debug.log*
+
+# ---- Local secrets / env ----
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ---- Local scratch / prototypes (not part of the shipped app) ----
+mcp_config_prototype.json
+settings_prototype.json
+test_prototype_flow.py
+/src/
+/tests/
+/docs/
